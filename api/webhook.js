@@ -4,37 +4,172 @@ export const config = {
   },
 };
 
-function readRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+import crypto from 'crypto';
+
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
-async function safeReadText(resp) {
+function safeJsonParse(str) {
   try {
-    return await resp.text();
+    return JSON.parse(str);
   } catch {
-    return '';
+    return null;
+  }
+}
+
+async function forwardToWoll(rawBody, headers) {
+  const url = process.env.WOLL_WEBHOOK_URL;
+  if (!url) {
+    return { ok: false, skipped: true, reason: 'WOLL_WEBHOOK_URL ausente' };
+  }
+
+  const outHeaders = {
+    'content-type': headers['content-type'] || 'application/json',
+  };
+
+  if (headers['x-hub-signature-256']) {
+    outHeaders['x-hub-signature-256'] = headers['x-hub-signature-256'];
+  }
+
+  if (process.env.WOLL_VERIFY_TOKEN) {
+    outHeaders['x-woll-verify-token'] = process.env.WOLL_VERIFY_TOKEN;
+  }
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: outHeaders,
+    body: rawBody,
+  });
+
+  const text = await resp.text();
+  console.log('Resposta Woll:', resp.status, text.slice(0, 500));
+
+  return { ok: resp.ok, status: resp.status, body: text.slice(0, 500) };
+}
+
+function extractMessageInfo(payload) {
+  const entries = payload?.entry || [];
+  const changes = entries.flatMap((e) => e.changes || []);
+
+  for (const change of changes) {
+    const value = change?.value;
+    const contact = value?.contacts?.[0];
+    const msg = value?.messages?.[0];
+    const status = value?.statuses?.[0];
+
+    if (msg) {
+      const from = msg.from || 'desconhecido';
+      const name = contact?.profile?.name || from;
+      const type = msg.type || 'unknown';
+
+      let text = '';
+      if (type === 'text') text = msg.text?.body || '';
+      else if (type === 'image') text = '[imagem recebida]';
+      else if (type === 'audio') text = '[áudio recebido]';
+      else if (type === 'document') text = `[documento recebido: ${msg.document?.filename || 'sem nome'}]`;
+      else if (type === 'video') text = '[vídeo recebido]';
+      else if (type === 'location') text = '[localização recebida]';
+      else if (type === 'button') text = `[botão: ${msg.button?.text || ''}]`;
+      else if (type === 'interactive') text = '[interação recebida]';
+      else text = `[mensagem do tipo ${type}]`;
+
+      return {
+        kind: 'message',
+        phone: from,
+        name,
+        text,
+        waMessageId: msg.id || null,
+        timestamp: msg.timestamp || null,
+      };
+    }
+
+    if (status) {
+      return {
+        kind: 'status',
+        phone: status.recipient_id || 'desconhecido',
+        name: status.recipient_id || 'desconhecido',
+        text: `[status da mensagem: ${status.status}]`,
+        waMessageId: status.id || null,
+        timestamp: status.timestamp || null,
+      };
+    }
+  }
+
+  return null;
+}
+
+async function sendToDatacrazy(info) {
+  const url = process.env.DATACRAZY_WEBHOOK_URL;
+
+  if (!url) {
+    throw new Error('DATACRAZY_WEBHOOK_URL ausente');
+  }
+
+  const ddi = info.phone?.startsWith('55') ? '55' : '';
+  const telefone = ddi ? info.phone.slice(2) : info.phone;
+
+  const payload = {
+    nome: info.name || 'Sem nome',
+    telefone: telefone || '',
+    ddi: ddi || '',
+    telefone_completo: info.phone ? `+${info.phone}` : '',
+    mensagem: info.text || '',
+    origem: 'WhatsApp',
+    tipo: info.kind || 'message',
+    wa_message_id: info.waMessageId || '',
+    timestamp: info.timestamp || '',
+    empresa: '',
+    email: '',
+    tags: ['whatsapp', 'woll', 'meta'],
+  };
+
+  console.log('Enviando para Datacrazy:', JSON.stringify(payload));
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await resp.text();
+  console.log('Resposta Datacrazy:', resp.status, text);
+
+  if (!resp.ok) {
+    throw new Error(`Datacrazy falhou: ${resp.status} ${text}`);
+  }
+
+  return text;
+}
+
+function verifyMetaSignature(rawBody, signature, appSecret) {
+  if (!signature || !appSecret) return true;
+
+  const expected =
+    'sha256=' +
+    crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
   }
 }
 
 export default async function handler(req, res) {
-  const WOLL_WEBHOOK_URL = process.env.WOLL_WEBHOOK_URL;
-  const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
-
-  if (!WOLL_WEBHOOK_URL) {
-    return res.status(500).json({ ok: false, error: 'Missing WOLL_WEBHOOK_URL env var' });
-  }
-
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
-    if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    if (mode === 'subscribe' && token === process.env.META_VERIFY_TOKEN) {
       return res.status(200).send(challenge);
     }
 
@@ -42,53 +177,38 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== 'POST') {
-    res.setHeader('Allow', 'GET, POST');
-    return res.status(405).send('Method Not Allowed');
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   const rawBody = await readRawBody(req);
+  const rawText = rawBody.toString('utf8');
+  const payload = safeJsonParse(rawText);
 
-  const incomingHeaders = req.headers || {};
-  const forwardHeaders = {
-    'content-type': incomingHeaders['content-type'] || 'application/json',
-  };
+  if (!payload) {
+    return res.status(400).json({ error: 'JSON inválido' });
+  }
 
-  if (incomingHeaders['x-hub-signature-256']) {
-    forwardHeaders['x-hub-signature-256'] = incomingHeaders['x-hub-signature-256'];
+  const signature = req.headers['x-hub-signature-256'];
+  const appSecret = process.env.META_APP_SECRET || '';
+
+  if (!verifyMetaSignature(rawBody, signature, appSecret)) {
+    return res.status(401).json({ error: 'Assinatura inválida' });
   }
-  if (incomingHeaders['x-hub-signature']) {
-    forwardHeaders['x-hub-signature'] = incomingHeaders['x-hub-signature'];
-  }
-  if (incomingHeaders['user-agent']) {
-    forwardHeaders['user-agent'] = incomingHeaders['user-agent'];
+
+  res.status(200).json({ ok: true });
+
+  try {
+    await forwardToWoll(rawBody, req.headers);
+  } catch (err) {
+    console.error('Erro ao enviar para o Woll:', err);
   }
 
   try {
-    const wollResp = await fetch(WOLL_WEBHOOK_URL, {
-      method: 'POST',
-      headers: forwardHeaders,
-      body: rawBody,
-    });
+    const info = extractMessageInfo(payload);
+    if (!info) return;
 
-    const wollText = await safeReadText(wollResp);
-
-    console.log('Forwarded to Woll:', {
-      status: wollResp.status,
-      bodyPreview: wollText.slice(0, 500),
-    });
-
-    if (!wollResp.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: 'Woll rejected forwarded webhook',
-        wollStatus: wollResp.status,
-        wollResponse: wollText.slice(0, 1000),
-      });
-    }
-
-    return res.status(200).json({ ok: true, forwarded: true });
-  } catch (error) {
-    console.error('Proxy error:', error);
-    return res.status(500).json({ ok: false, error: error?.message || 'Unknown proxy error' });
+    await sendToDatacrazy(info);
+  } catch (err) {
+    console.error('Erro ao enviar para o Datacrazy:', err);
   }
 }
